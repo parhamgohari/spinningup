@@ -3,10 +3,81 @@ import torch
 from torch.optim import Adam
 import gym
 import time
+import joblib
+import os
+import os.path as osp
+import tensorflow as tf
 import spinup.algos.pytorch.ppo.core as core
+from spinup.utils.logx import restore_tf_graph
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+from torch.distributions.dirichlet import Dirichlet
+from torch.distributions.categorical import Categorical
+
+def load_teacher(fpath = None, itr = 'last', deterministic = False):
+    if fpath is None:
+        fpath = input('\n\n Enter the teacher direcory\n\n')
+
+    if any(['tf1_save' in x for x in os.listdir(fpath)]):
+        backend = 'tf1'
+    else:
+        backend = 'pytorch'
+
+    # handle which epoch to load from
+    if itr=='last':
+        # check filenames for epoch (AKA iteration) numbers, find maximum value
+
+        if backend == 'tf1':
+            saves = [int(x[8:]) for x in os.listdir(fpath) if 'tf1_save' in x and len(x)>8]
+
+        elif backend == 'pytorch':
+            pytsave_path = osp.join(fpath, 'pyt_save')
+            # Each file in this folder has naming convention 'modelXX.pt', where
+            # 'XX' is either an integer or empty string. Empty string case
+            # corresponds to len(x)==8, hence that case is excluded.
+            saves = [int(x.split('.')[0][5:]) for x in os.listdir(pytsave_path) if len(x)>8 and 'model' in x]
+            
+        itr = '%d'%max(saves) if len(saves) > 0 else ''
+        # itr = itr/2
+
+    else:
+        assert isinstance(itr, int), \
+            "Bad value provided for itr (needs to be int or 'last')."
+        itr = '%d'%itr
+    # if backend == 'tf1':
+    #     fname = osp.join(fpath, 'tf1_save'+itr)
+    #     print('\n\nLoading from %s.\n\n'%fname)
+
+    #     # load the things!
+    #     sess = tf.Session()
+    #     model = restore_tf_graph(sess, fname)
+
+    #     print('Using default action op.')
+    #     action_op = model['logp']
+
+    #     get_action_probs = lambda x : sess.run(action_op, feed_dict={model['x']: x[None,:]})[0]
+
+    fname = osp.join(fpath, 'pyt_save', 'model'+itr+'.pt')
+    print('\n\nLoading from %s.\n\n'%fname)
+
+    model = torch.load(fname)
+    # fname = osp.join(fpath, 'tf1_save'+itr)
+    # print('\n\nLoading from %s.\n\n'%fname)
+
+    # # load the things!
+    # sess = tf.Session()
+    # model = restore_tf_graph(sess, fname)
+
+    # make function for producing an action given a single state
+    def get_action_probs(x, actions = None):
+        with torch.no_grad():
+            x = torch.as_tensor(x, dtype=torch.float32)
+            pi = model.pi(x)
+        return pi[0]
+
+    return get_action_probs
+
 
 
 class PPOBuffer:
@@ -88,7 +159,7 @@ class PPOBuffer:
 def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10, beta = 0.3, k=None, lamb = 0.5, privacy = False, teacher_directory = None):
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -193,6 +264,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+    print("Privacy protection: ", privacy)
+
     setup_pytorch_for_mpi()
 
     # Set up logger and save configuration
@@ -223,15 +296,58 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
+    #Load the teacher policy
+    teacher_policy = load_teacher(fpath = teacher_directory)
+
+
+    def Dirichlet_mechanism(p,k):
+        return Categorical(Dirichlet(k*p).sample())
+
+    def Phi(p, q, k, beta, lamb):
+        alpha = lamb * np.sqrt(np.log(1.0/beta)/(2*(k+1)))
+        diff = torch.norm(p-q,p = 2, dim = 1)
+        if diff.mean() > alpha:
+            print("\n \n Teacher activated with alpha = ", alpha)
+            print("\n \n Policy differnce = ", diff.mean())
+            return diff
+        else:
+            print("\n \n Teacher NOT activated with alpha = ", alpha)
+            print("\n \n Policy differnce = ", diff.mean())
+            return diff * 0
+
+
+
+
     # Set up function for computing PPO policy loss
-    def compute_loss_pi(data):
+    def compute_loss_pi(data, k , beta , lamb , privacy):
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
 
         # Policy loss
         pi, logp = ac.pi(obs, act)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
-        loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+        if privacy == False:
+            loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+
+        else:
+            loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta, lamb).mean()
+
+        # print('LOOK AT ME: ', Phi(pi.probs, teacher_policy(obs).probs, k, beta).mean())
+        # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + lamb * Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean()
+        # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + lamb * torch.norm((pi.probs - Dirichlet_mechanism(teacher_policy(obs).probs,k).probs),2).mean()
+        # print((torch.min(ratio * adv, clip_adv)).mean()/Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean())
+        # print('J1: ', -(torch.min(ratio * adv, clip_adv)).mean())
+        # print('J2: ', Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean())
+        # input()
+        # if k is None:
+        #     loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + beta * torch.norm((pi.probs - teacher_policy(obs).probs),2).mean()
+        # else:
+            # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + beta * torch.norm((pi.probs - Dirichlet_mechanism(teacher_policy(obs).probs,k).probs),2).mean()
+
+        # print('Student policy: ', pi.probs)
+        # print('Teacher policy: ', teacher_policy(obs).probs)
+        # print('Hellinger_distance: ', Hellinger_distance(pi.probs, teacher_policy(obs).probs).mean())
+        # print('loss_pi: ', loss_pi)
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -254,21 +370,22 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
-    def update():
+    def update(k, beta, lamb, privacy):
         data = buf.get()
 
-        pi_l_old, pi_info_old = compute_loss_pi(data)
+        pi_l_old, pi_info_old = compute_loss_pi(data, k, beta, lamb, privacy)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
-            loss_pi, pi_info = compute_loss_pi(data)
+            loss_pi, pi_info = compute_loss_pi(data,k, beta, lamb, privacy)
             kl = mpi_avg(pi_info['kl'])
-            if kl > 1.5 * target_kl:
-                logger.log('Early stopping at step %d due to reaching max kl.'%i)
-                break
+            if privacy == False:
+                if kl > 1.5 * target_kl:
+                    logger.log('Early stopping at step %d due to reaching max kl.'%i)
+                    break
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
             pi_optimizer.step()
@@ -334,7 +451,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.save_state({'env': env}, None)
 
         # Perform PPO update!
-        update()
+        update(k, beta, lamb, privacy)
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
@@ -365,7 +482,12 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--k', type=float, default=None)
+    parser.add_argument('--lamb', type=float, default=0.5)
+    parser.add_argument('--beta', type=float, default=0.3)
+    parser.add_argument('--privacy', type=bool, default=False)
     args = parser.parse_args()
+
 
     mpi_fork(args.cpu)  # run parallel code with mpi
 
@@ -374,5 +496,6 @@ if __name__ == '__main__':
 
     ppo(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
-        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
+        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs, 
+        k=args.k, privacy = args.privacy, lamb = args.lamb, beta = args.beta,
         logger_kwargs=logger_kwargs)
