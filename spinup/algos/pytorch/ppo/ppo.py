@@ -15,9 +15,8 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 from torch.distributions.dirichlet import Dirichlet
 from torch.distributions.categorical import Categorical
 
-def load_teacher(fpath = None, itr = 'last', deterministic = False):
-    if fpath is None:
-        fpath = input('\n\n Enter the teacher direcory\n\n')
+def load_teacher(fpath, itr = 'last', deterministic = False):
+    assert fpath is not None, "Teacher directory not specified"
 
     if any(['tf1_save' in x for x in os.listdir(fpath)]):
         backend = 'tf1'
@@ -59,7 +58,7 @@ def load_teacher(fpath = None, itr = 'last', deterministic = False):
     #     get_action_probs = lambda x : sess.run(action_op, feed_dict={model['x']: x[None,:]})[0]
 
     fname = osp.join(fpath, 'pyt_save', 'model'+itr+'.pt')
-    print('\n\nLoading from %s.\n\n'%fname)
+    print('\n\nLoading teacher\'s policy from %s.\n\n'%fname)
 
     model = torch.load(fname)
     # fname = osp.join(fpath, 'tf1_save'+itr)
@@ -159,7 +158,8 @@ class PPOBuffer:
 def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10, beta = 0.3, k=None, lamb = 0.5, privacy = False, teacher_directory = None):
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10, beta = 0.1, k=5, lamb = 1,
+        privacy = False, teacher = False, teacher_directory = None):
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -264,6 +264,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+
+
     print("Privacy protection: ", privacy)
 
     setup_pytorch_for_mpi()
@@ -297,7 +299,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
     #Load the teacher policy
-    teacher_policy = load_teacher(fpath = teacher_directory)
+    if teacher == True:
+        teacher_policy = load_teacher(fpath = teacher_directory)
 
 
     def Dirichlet_mechanism(p,k):
@@ -307,12 +310,12 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         alpha = lamb * np.sqrt(np.log(1.0/beta)/(2*(k+1)))
         diff = torch.norm(p-q,p = 2, dim = 1)
         if diff.mean() > alpha:
-            print("\n \n Teacher activated with alpha = ", alpha)
-            print("\n \n Policy differnce = ", diff.mean())
+            # print("\n \n Teacher activated with alpha = ", alpha)
+            # print("\n \n Policy differnce = ", diff.mean())
             return diff
         else:
-            print("\n \n Teacher NOT activated with alpha = ", alpha)
-            print("\n \n Policy differnce = ", diff.mean())
+            # print("\n \n Teacher NOT activated with alpha = ", alpha)
+            # print("\n \n Policy differnce = ", diff.mean())
             return diff * 0
 
 
@@ -326,28 +329,15 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         pi, logp = ac.pi(obs, act)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
-        if privacy == False:
+        if teacher == False:
             loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
 
-        else:
+        elif privacy == True:
             loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta, lamb).mean()
 
-        # print('LOOK AT ME: ', Phi(pi.probs, teacher_policy(obs).probs, k, beta).mean())
-        # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + lamb * Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean()
-        # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + lamb * torch.norm((pi.probs - Dirichlet_mechanism(teacher_policy(obs).probs,k).probs),2).mean()
-        # print((torch.min(ratio * adv, clip_adv)).mean()/Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean())
-        # print('J1: ', -(torch.min(ratio * adv, clip_adv)).mean())
-        # print('J2: ', Phi(pi.probs, Dirichlet_mechanism(teacher_policy(obs).probs, k).probs, k, beta).mean())
-        # input()
-        # if k is None:
-        #     loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + beta * torch.norm((pi.probs - teacher_policy(obs).probs),2).mean()
-        # else:
-            # loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + beta * torch.norm((pi.probs - Dirichlet_mechanism(teacher_policy(obs).probs,k).probs),2).mean()
+        elif privacy == False:
+            loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() + Phi(pi.probs, teacher_policy(obs).probs, k, beta, 0).mean()
 
-        # print('Student policy: ', pi.probs)
-        # print('Teacher policy: ', teacher_policy(obs).probs)
-        # print('Hellinger_distance: ', Hellinger_distance(pi.probs, teacher_policy(obs).probs).mean())
-        # print('loss_pi: ', loss_pi)
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -486,6 +476,8 @@ if __name__ == '__main__':
     parser.add_argument('--lamb', type=float, default=0.5)
     parser.add_argument('--beta', type=float, default=0.3)
     parser.add_argument('--privacy', type=bool, default=False)
+    parser.add_argument('--teacher', type=bool, default=False)
+    parser.add_argument('--teacher_directory', type=str, default='')
     args = parser.parse_args()
 
 
@@ -498,4 +490,11 @@ if __name__ == '__main__':
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs, 
         k=args.k, privacy = args.privacy, lamb = args.lamb, beta = args.beta,
-        logger_kwargs=logger_kwargs)
+        logger_kwargs=logger_kwargs, teacher = args.teacher, teacher_directory = args.teacher_directory)
+
+
+
+
+
+
+
